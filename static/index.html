@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Recitation reveal prototype</title>
+<style>
+ body{font-family:system-ui,sans-serif;margin:0;background:#faf9f6;color:#222}
+ header{padding:12px 20px;background:#1f5c4a;color:#fff;font-weight:600}
+ #controls{display:flex;flex-wrap:wrap;gap:12px;align-items:center;padding:12px 20px;background:#eef3f0}
+ #controls input[type=number]{width:64px}
+ button{padding:7px 14px;border:0;border-radius:6px;background:#1f5c4a;color:#fff;cursor:pointer}
+ button:disabled{opacity:.5}
+ #page{direction:rtl;margin:24px auto;max-width:900px;min-height:220px;padding:28px 32px;background:#fff;
+   border:1px solid #ddd;border-radius:10px;font-family:"Amiri","Scheherazade New","Traditional Arabic",serif;
+   font-size:40px;line-height:2.3;box-shadow:0 1px 6px #0001}
+ .w{display:inline-block;margin:0 6px;padding:0 4px;border-bottom:3px solid transparent;color:transparent;transition:color .45s ease,border-color .3s}
+ body.hint .w{border-bottom-color:#e3e3e3}
+ .w.on{color:#111}
+ .w.next{border-bottom-color:#2e7d64;animation:pulse 1.3s infinite}
+ @keyframes pulse{50%{border-bottom-color:#bfe3d5}}
+ .w.err{color:#c62828;border-bottom-color:#c62828;background:#fdecea;border-radius:4px}
+ .w.err.hide{color:transparent}
+ #status{max-width:900px;margin:0 auto;padding:0 8px;font-size:15px}
+ #msg{font-weight:600;min-height:24px}
+ #dbg{max-width:900px;margin:14px auto;padding:12px;background:#f3f3f3;border-radius:8px;font:13px/1.6 ui-monospace,monospace}
+ #meter{height:8px;background:#ddd;border-radius:4px;overflow:hidden;width:200px;display:inline-block;vertical-align:middle}
+ #bar{height:100%;width:0;background:#2e7d64}
+ #hyp{direction:rtl;font-size:20px;font-family:inherit}
+ .sim{max-width:900px;margin:8px auto;display:flex;gap:8px}
+ .sim input{flex:1;direction:rtl;font-size:18px;padding:6px}
+</style></head><body>
+<header>Recitation reveal — local prototype</header>
+<div id="controls">
+ <label>Surah <input id="surah" type="number" value="112" min="1" max="114"></label>
+ <label>Ayah from <input id="from" type="number" value="1" min="1"></label>
+ <label>to <input id="to" type="number" value="4" min="1"></label>
+ <label>Strictness <input id="thr" type="range" min="60" max="98" value="85"> <span id="thrv">0.85</span></label>
+ <label><input id="hint" type="checkbox"> faint hints</label>
+ <button id="load">Load</button>
+ <button id="mic" disabled>Start mic</button>
+ <span>level <span id="meter"><div id="bar"></div></span></span>
+</div>
+<details style="padding:0 20px 8px;background:#eef3f0"><summary>Custom text (overrides surah/ayah)</summary>
+ <textarea id="custom" dir="rtl" rows="3" style="width:100%;font-size:18px"></textarea></details>
+<div id="page"></div>
+<div id="status"><div id="msg"></div></div>
+<div class="sim"><input id="sim" placeholder="Simulate what the recogniser heard (no mic/model needed)…"><button id="simgo">Send</button></div>
+<div id="dbg">backend: <span id="be">-</span> · speech: <span id="sp">-</span> · ASR: <span id="ms">-</span> ms ·
+ revealed: <span id="rv">0</span><br>heard: <span id="hyp"></span></div>
+<script>
+let ws=null, words=[], micOn=false, ctx=null, stream=null;
+const $=id=>document.getElementById(id);
+$('thr').oninput=()=>{$('thrv').textContent=(+$('thr').value/100).toFixed(2); send({type:'config',thr:+$('thr').value/100});};
+$('hint').onchange=()=>document.body.classList.toggle('hint',$('hint').checked);
+function send(o){ if(ws&&ws.readyState===1) ws.send(JSON.stringify(o)); }
+
+function connect(){
+  if(ws) ws.close();
+  ws=new WebSocket((location.protocol==='https:'?'wss':'ws')+'://'+location.host+'/ws');
+  ws.onopen=()=>{
+    const custom=$('custom').value.trim();
+    send(custom?{type:'init',text:custom,thr:+$('thr').value/100}
+      :{type:'init',surah:+$('surah').value,from:+$('from').value,to:+$('to').value,thr:+$('thr').value/100});
+    $('msg').textContent='Loading text…';
+  };
+  ws.onmessage=e=>{
+    const m=JSON.parse(e.data);
+    if(m.type==='ready'){ words=m.words; render(); $('be').textContent=m.backend; $('mic').disabled=false; $('msg').textContent='Ready. Press "Start mic" and recite.'; }
+    else if(m.type==='error'){ $('msg').textContent=m.message; }
+    else if(m.type==='vad'){ $('sp').textContent=m.speech?'yes':'no'; $('bar').style.width=Math.min(100,m.rms*400)+'%'; }
+    else if(m.type==='state'){ paint(m); }
+  };
+  ws.onclose=()=>{ if(micOn) stopMic(); };
+}
+let shown=0,target=0,timer=null,curErr=null,doneFlag=false;
+function render(){
+  $('page').innerHTML=''; shown=0; target=0; curErr=null; doneFlag=false;
+  words.forEach((w,i)=>{const s=document.createElement('span'); s.className='w'; s.id='w'+i; s.textContent=w; $('page').appendChild(s);});
+  mark();
+}
+function mark(){
+  document.querySelectorAll('.w.next').forEach(e=>e.classList.remove('next'));
+  if(micOn && !curErr && shown<words.length){ const el=$('w'+shown); if(el) el.classList.add('next'); }
+}
+// Server results arrive in bursts (ASR latency); words are revealed one by one at a steady pace.
+function paint(m){
+  target=Math.max(target,m.revealed); curErr=m.error; doneFlag=m.done;
+  $('hyp').textContent=m.hyp; $('ms').textContent=m.asr_ms; $('rv').textContent=m.revealed+'/'+words.length;
+  if(!timer) timer=setInterval(tick,110);
+  tick();
+}
+function tick(){
+  if(shown<target){ $('w'+shown).classList.add('on'); shown++; }
+  document.querySelectorAll('.w.err').forEach(e=>e.classList.remove('err'));
+  if(shown>=target){
+    clearInterval(timer); timer=null;
+    if(curErr){
+      const el=$('w'+curErr.index); if(el) el.classList.add('err','on');
+      $('msg').textContent='❌ Stopped at word '+(curErr.index+1)+' ('+(curErr.kind==='skip'?'word skipped or swapped':'different word heard')+') — pause, then re-read from there.';
+    } else $('msg').textContent=doneFlag?'✅ Complete':'';
+  }
+  mark();
+}
+$('load').onclick=connect;
+$('simgo').onclick=()=>{ if($('sim').value.trim()) send({type:'hyp',text:$('sim').value.trim()}); };
+$('sim').onkeydown=e=>{ if(e.key==='Enter') $('simgo').click(); };
+
+const workletSrc=`
+class PCM16 extends AudioWorkletProcessor{
+ constructor(){super(); this.ratio=sampleRate/16000; this.pos=0; this.rem=new Float32Array(0); this.acc=[];}
+ process(inputs){
+  const ch=inputs[0][0]; if(!ch) return true;
+  const m=new Float32Array(this.rem.length+ch.length); m.set(this.rem); m.set(ch,this.rem.length);
+  let pos=this.pos;
+  while(pos+1<m.length){const i=Math.floor(pos), f=pos-i; this.acc.push(m[i]*(1-f)+m[i+1]*f); pos+=this.ratio;}
+  const drop=Math.floor(pos); this.rem=m.slice(drop); this.pos=pos-drop;
+  if(this.acc.length>=1600){
+    const a=new Int16Array(this.acc.length);
+    for(let k=0;k<a.length;k++) a[k]=Math.max(-1,Math.min(1,this.acc[k]))*32767;
+    this.port.postMessage(a.buffer,[a.buffer]); this.acc=[];
+  }
+  return true;
+ }}
+registerProcessor('pcm16',PCM16);`;
+
+async function startMic(){
+  stream=await navigator.mediaDevices.getUserMedia({audio:{channelCount:1,echoCancellation:false,noiseSuppression:false,autoGainControl:true}});
+  ctx=new AudioContext();
+  await ctx.audioWorklet.addModule(URL.createObjectURL(new Blob([workletSrc],{type:'application/javascript'})));
+  const node=new AudioWorkletNode(ctx,'pcm16');
+  node.port.onmessage=e=>{ if(ws&&ws.readyState===1) ws.send(e.data); };
+  ctx.createMediaStreamSource(stream).connect(node);
+  micOn=true; $('mic').textContent='Stop mic'; mark();
+}
+function stopMic(){ micOn=false; mark(); if(stream) stream.getTracks().forEach(t=>t.stop()); if(ctx) ctx.close(); $('mic').textContent='Start mic'; }
+$('mic').onclick=()=>micOn?stopMic():startMic().catch(e=>{$('msg').textContent='Mic error: '+e.message;});
+connect();
+</script></body></html>

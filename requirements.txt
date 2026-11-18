@@ -1,0 +1,8 @@
+fastapi
+uvicorn[standard]
+numpy
+torch
+transformers
+# tests only:
+pytest
+httpx
